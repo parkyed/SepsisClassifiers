@@ -1,0 +1,1795 @@
+---
+title: "logistic regression classifiers for transcriptomics data: performance and feature stability measures"
+author: "Ed Parkinson"
+date: "20/06/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+============================================================================================================
+##################################### Load Libraries and Working Directory #################################
+============================================================================================================
+
+```{r setup, include=FALSE, echo=FALSE}
+
+## set working directory to the folder where the rmd code file is stored [could be updated using Here package, but need to figure out]
+setwd("/Users/ep/Documents/1_datasets/dataset_pearth/an0304/bin")
+
+figs.path <- "../figs/v2/"
+data.path <- "../output/v2/"
+
+library(here)
+library(tidyverse)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(e1071)        # package for svms
+library(glmnet)       # for logistic regression
+library(LiblineaR)    # fast implementation of penalised Linear SVM
+library(randomForest) # for random forest
+library(ROCR)         # for calculating roc auc and plotting roc curves
+library(DESeq2)       # differential expression analysis
+library(reshape2)     # for melt function 
+library(foreach)      # parallelisation function
+library(doParallel)   # enables parallelisation of cores
+library(stabm)      # for stability measures
+library(coop)       # fast calculation of correlation matrices
+library(Rfast)      # fast calculation of correlation matrices
+library(Matrix)     # to create sparse matrix
+library(cowplot)    # ability to plot grids
+
+# source functions contained in scripts
+
+source("scr/scale_transform.R")
+source("scr/stability_metrics.R")
+source("scr/create_datasets_thresholds.R")
+source("scr/lr_glmnet.R")
+source("scr/random_sample.R")
+source("scr/svm_models.R")
+source("scr/random_forest_models.R")
+
+```
+
+============================================================================================================
+##################################### Protect Sepsis Data Set - Import #####################################
+============================================================================================================
+
+```{r import protect dataset}
+
+## load preprocessed RData objects for the dataset
+
+load(file=paste(data.path, "raw_counts.RData", sep=""))
+load(file=paste(data.path, "norm_counts.RData", sep=""))
+# load(file=paste(data.path, "rlog_counts.RData", sep=""))
+load(file=paste(data.path, "targets.RData", sep=""))
+load(file=paste(data.path, "test.dataset.RData", sep=""))
+
+# check data imported
+dim(countsData)
+dim(normalisedCounts)
+# dim(rlogNormalisedCounts)
+glimpse(targets)
+
+```
+
+======================================== Test Dataset  ==============================================
+
+```{r create testing dataset}
+
+# create and save a dataset with a low number of features for testing - use the dataset where features have a fold change >2.0 (see below)
+# function automatically vst transforms the dataset, but doesn't transpose it
+
+datasets.fold.change.above.two <- createFoldChangeThresholdDatasets(raw.counts  = countsData,
+                                                  norm.counts = normalisedCounts,
+                                                  sample.info = targets,
+                                                  noise.fil   = 60,
+                                                  fc.range     =   c(2.0, 2.5))
+
+# check the number of variables
+for(i in datasets.fold.change.above.two){print(dim(i))}
+
+test.dataset <- datasets.fold.change.above.two[[1]]
+#save(test.dataset,    file=paste(data.path, "test.dataset.RData", sep=""))
+load(file=paste(data.path, "test.dataset.RData", sep=""))
+
+# check dimensions
+for(i in test.datasets){print(dim(i))}
+
+```
+
+============================================================================================================
+#################################################### Analysis ##############################################
+============================================================================================================
+
+=================================================   Data Sets   ============================================
+
+```{r create alternative datasets and parameter ranges}
+# set alternative low count filter thresholds
+# lc.threshold.range = c(0,60)
+
+# create vst transformed datasets: unfiltered, low count filtered, outlier filtered
+protect.unfiltered <- createNoiseThresholdDatasets(raw.counts = countsData, norm.counts = normalisedCounts,sample.info = targets,t.range = c(0))[[1]]
+protect.lc.filtered <-createNoiseThresholdDatasets(raw.counts = countsData, norm.counts = normalisedCounts,sample.info = targets,t.range = c(60))[[1]]
+protect.ol.filtered <-createOutlierThresholdDatasets(raw.counts = countsData,norm.counts = normalisedCounts,sample.info = targets,noise.fil= 0, q.range=c(0.95))[[1]]
+protect.lcol.filtered <- createLCOLDatasets(raw.counts = countsData,norm.counts = normalisedCounts,sample.info = targets,noise.fil= 60, quantile=c(0.95))
+```
+
+```{r save datasets}
+# save outputs given run times
+save(protect.unfiltered,    file=paste(data.path, "protect.unfiltered.RData", sep=""))
+save(protect.lc.filtered,    file=paste(data.path, "protect.lc.filtered.RData", sep=""))
+save(protect.ol.filtered,    file=paste(data.path, "protect.ol.filtered.RData", sep=""))
+save(protect.lcol.filtered,    file=paste(data.path, "protect.lcol.filtered.RData", sep=""))
+```
+
+```{r load datasets}
+# load output files
+load(file=paste(data.path, "protect.unfiltered.RData", sep=""))
+load(file=paste(data.path, "protect.lc.filtered.RData", sep=""))
+load(file=paste(data.path, "protect.ol.filtered.RData", sep=""))
+load(file=paste(data.path, "protect.lcol.filtered.RData", sep=""))
+```
+
+```{r prepare model inputs}
+
+# scale the x matrices to between 0 and 1 for svm model
+protect.unfiltered.zeroOne    = apply(protect.unfiltered,    2, normalize)
+protect.lc.filtered.zeroOne   = apply(protect.lc.filtered,   2, normalize)
+protect.ol.filtered.zeroOne   = apply(protect.ol.filtered,   2, normalize)
+protect.lcol.filtered.zeroOne = apply(protect.lcol.filtered, 2, normalize)
+
+# convert class labels to a factor
+(y.true = factor(targets$svm.class, levels=c(1, -1)))
+
+# define the parameter grid for the svm cost penalty grid search
+param.grid <-vector(); for (num in c(1, 5)) param.grid<-sort(c(param.grid, c(num*10^seq(-2, 1, 1))) )
+(param.grid <- as.list(param.grid))
+
+# calculate the correlation matrix on the unfiltered dataset
+# corr.unfiltered <- scaleCorrelationCoop(protect.unfiltered)
+# save(corr.unfiltered,    file=paste(data.path, "corr.unfiltered.RData", sep=""))
+load(file=paste(data.path, "corr.unfiltered.RData", sep=""))
+
+```
+
+=================================================   Model Performance   ============================================
+
+```{r testing}
+# svm.unfiltered         <- svmCVModel(x.matrix = protect.unfiltered.zeroOne, y.labels = y.true, n.folds="loocv", param.grid=param.grid)
+# rf.unfiltered          <- rfNFeatModel(x=protect.unfiltered.zeroOne, y=y.true, n.feature=30, ntree = 1000)
+# lr.unfiltered.rep      <- replicate(10, cv.lr.feature.selection(x=protect.unfiltered.zeroOne, y=y.true, k = "loocv", a = 0.95), simplify = TRUE)
+```
+
+```{r model performance: cv or oob metrics on full dataset}
+# run full data sets on each model to get the performance metrics (AUC, F1 scores)
+
+# unfiltered
+lr.unfiltered          <- cv.lr.feature.selection(x=protect.unfiltered.zeroOne, y=y.true, k = "loocv", a = 0.95)
+(svm.unfiltered.rep = replicate(10, svmCVModel(x.matrix = protect.unfiltered.zeroOne, y.labels = y.true, n.folds="loocv", param.grid=param.grid), simplify=TRUE))
+(rf.unfiltered.rep = replicate(10, rfNFeatModel(x=protect.unfiltered.zeroOne, y=y.true, n.feature=30, ntree = 1000), simplify=TRUE))
+
+# low count filtered
+lr.lc.filtered         <- cv.lr.feature.selection(x=protect.lc.filtered.zeroOne, y=y.true, k = "loocv", a = 0.95)
+(svm.lc.filtered.rep = replicate(10, svmCVModel(x.matrix = protect.lc.filtered.zeroOne, y.labels = y.true, n.folds="loocv", param.grid=param.grid), simplify=TRUE))
+(rf.lc.filtered.rep = replicate(10, rfNFeatModel(x=protect.lc.filtered.zeroOne, y=y.true, n.feature=30, ntree = 1000), simplify=TRUE))
+
+# outlier filtered
+lr.ol.filtered         <- cv.lr.feature.selection(x=protect.ol.filtered.zeroOne, y=y.true, k = "loocv", a = 0.95)
+(svm.ol.filtered.rep = replicate(10, svmCVModel(x.matrix = protect.ol.filtered.zeroOne, y.labels = y.true, n.folds="loocv", param.grid=param.grid), simplify=TRUE))
+(rf.ol.filtered.rep = replicate(10, rfNFeatModel(x=protect.ol.filtered.zeroOne, y=y.true, n.feature=30, ntree = 1000), simplify=TRUE))
+
+# low count and outlier filtered
+lr.lcol.filtered         <- cv.lr.feature.selection(x=protect.lcol.filtered.zeroOne, y=y.true, k = "loocv", a = 0.95)
+(svm.lcol.filtered.rep = replicate(10, svmCVModel(x.matrix = protect.lcol.filtered.zeroOne, y.labels = y.true, n.folds="loocv", param.grid=param.grid), simplify=TRUE))
+(rf.lcol.filtered.rep = replicate(10, rfNFeatModel(x=protect.lcol.filtered.zeroOne, y=y.true, n.feature=30, ntree = 1000), simplify=TRUE))
+
+# save outputs given run times
+(results.unfiltered = list('lr' = lr.unfiltered,  'svm' = svm.unfiltered.rep, 'rf' = rf.unfiltered.rep))
+(results.lc.filtered = list('lr' = lr.lc.filtered,  'svm' = svm.lc.filtered.rep, 'rf' = rf.lc.filtered.rep))
+(results.ol.filtered = list('lr' = lr.ol.filtered,  'svm' = svm.ol.filtered.rep, 'rf' = rf.ol.filtered.rep))
+(results.lcol.filtered = list('lr' = lr.lcol.filtered,  'svm' = svm.lcol.filtered.rep, 'rf' = rf.lcol.filtered.rep))
+```
+
+```{r save model performance results}
+
+save(results.unfiltered, file=paste(data.path, "results.unfiltered.RData", sep=""))
+save(results.lc.filtered, file=paste(data.path, "results.lc.filtered.RData", sep=""))
+save(results.ol.filtered, file=paste(data.path, "results.ol.filtered.RData", sep=""))
+save(results.lcol.filtered, file=paste(data.path, "results.lcol.filtered.RData", sep=""))
+```
+
+```{r load model performance results}
+
+load(file=paste(data.path, "results.unfiltered.RData", sep=""))
+load(file=paste(data.path, "results.lc.filtered.RData", sep=""))
+load(file=paste(data.path, "results.ol.filtered.RData", sep=""))
+load(file=paste(data.path, "results.lcol.filtered.RData", sep=""))
+
+```
+
+=================================================   Feature stability   ============================================
+
+
+```{r unfiltered: feature stability over random samples}
+
+# create random samples
+xy.samples.unfiltered  <- createRandomSample(x = protect.unfiltered.zeroOne,  y = y.true, n.samp = 100, pcent.samp = 0.9)
+
+# register cluster for parallel computation (foreach)
+myCluster <- makeCluster(2, type = "FORK") # why "FORK"?
+registerDoParallel(myCluster)
+stopCluster(myCluster)
+
+lr.boot.results <- foreach(subsamp=xy.samples.unfiltered, .combine = 'cbind') %dopar% {
+  x.lr <-   as.matrix(subset(subsamp, select=-c(class)))
+  y.lr <-   subsamp$class
+  lr.model       <-  cv.lr.feature.selection(x=x.lr, y=y.lr, k = "loocv", a = 0.95)
+}
+
+svm.boot.results <- foreach(subsamp=xy.samples.unfiltered, .combine = 'cbind') %dopar% {
+  x.svm <-   as.matrix(subset(subsamp, select=-c(class)))
+  y.svm <-   subsamp$class
+  svm.model       <-  svmCVModel(x.matrix = x.svm, y.labels = y.svm, n.folds="loocv", param.grid=param.grid)
+}
+
+rf.boot.results <- foreach(subsamp=xy.samples.unfiltered, .combine = 'cbind') %dopar% {
+  x.rf <-   as.matrix(subset(subsamp, select=-c(class)))
+  y.rf <-   subsamp$class
+  rf.model       <-  rfNFeatModel(x=x.rf, y=y.rf, n.feature = 30, ntree = 1000)
+}
+
+save(lr.boot.results, file=paste(data.path, "lr.bs.results.unfiltered.RData", sep=""))
+save(svm.boot.results, file=paste(data.path, "svm.bs.results.unfiltered.RData", sep=""))
+save(rf.boot.results, file=paste(data.path, "rf.bs.results.unfiltered.RData", sep=""))
+
+```
+
+```{r lc filtered: feature stability over random samples}
+
+# create random samples
+xy.samples.lc.filtered <- createRandomSample(x = protect.lc.filtered.zeroOne, y = y.true, n.samp = 100, pcent.samp = 0.9)
+
+# register cluster for parallel computation (foreach)
+myCluster <- makeCluster(2, type = "FORK") # why "FORK"?
+registerDoParallel(myCluster)
+stopCluster(myCluster)
+
+lr.lc.fil.boot.results <- foreach(subsamp=xy.samples.lc.filtered, .combine = 'cbind') %dopar% {
+  x.lr <-   as.matrix(subset(subsamp, select=-c(class)))
+  y.lr <-   subsamp$class
+  lr.model       <-  cv.lr.feature.selection(x=x.lr, y=y.lr, k = "loocv", a = 0.95)
+}
+
+svm.lc.fil.boot.results <- foreach(subsamp=xy.samples.lc.filtered, .combine = 'cbind') %dopar% {
+  x.svm <-   as.matrix(subset(subsamp, select=-c(class)))
+  y.svm <-   subsamp$class
+  svm.model       <-  svmCVModel(x.matrix = x.svm, y.labels = y.svm, n.folds="loocv", param.grid=param.grid)
+}
+
+rf.lc.fil.boot.results <- foreach(subsamp=xy.samples.lc.filtered, .combine = 'cbind') %dopar% {
+  x.rf <-   as.matrix(subset(subsamp, select=-c(class)))
+  y.rf <-   subsamp$class
+  rf.model       <-  rfNFeatModel(x=x.rf, y=y.rf, n.feature = 30, ntree = 1000)
+}
+
+save(lr.lc.fil.boot.results, file=paste(data.path, "lr.bs.results.lc.filtered.RData", sep=""))
+save(svm.lc.fil.boot.results, file=paste(data.path, "svm.bs.results.lc.filtered.RData", sep=""))
+save(rf.lc.fil.boot.results, file=paste(data.path, "rf.bs.results.lc.filtered.RData", sep=""))
+
+```
+
+```{r ol filtered: feature stability over random samples}
+
+# create random samples
+xy.samples.ol.filtered <- createRandomSample(x = protect.ol.filtered.zeroOne, y = y.true, n.samp = 100, pcent.samp = 0.9)
+
+# register cluster for parallel computation (foreach)
+myCluster <- makeCluster(2, type = "FORK") # why "FORK"?
+registerDoParallel(myCluster)
+stopCluster(myCluster)
+
+lr.ol.fil.boot.results <- foreach(subsamp=xy.samples.ol.filtered, .combine = 'cbind') %dopar% {
+  x.lr <-   as.matrix(subset(subsamp, select=-c(class)))
+  y.lr <-   subsamp$class
+  lr.model       <-  cv.lr.feature.selection(x=x.lr, y=y.lr, k = "loocv", a = 0.95)
+}
+
+svm.ol.fil.boot.results <- foreach(subsamp=xy.samples.ol.filtered, .combine = 'cbind') %dopar% {
+  x.svm <-   as.matrix(subset(subsamp, select=-c(class)))
+  y.svm <-   subsamp$class
+  svm.model       <-  svmCVModel(x.matrix = x.svm, y.labels = y.svm, n.folds="loocv", param.grid=param.grid)
+}
+
+rf.ol.fil.boot.results <- foreach(subsamp=xy.samples.ol.filtered, .combine = 'cbind') %dopar% {
+  x.rf <-   as.matrix(subset(subsamp, select=-c(class)))
+  y.rf <-   subsamp$class
+  rf.model       <-  rfNFeatModel(x=x.rf, y=y.rf, n.feature = 30, ntree = 1000)
+}
+
+save(lr.ol.fil.boot.results, file=paste(data.path, "lr.bs.results.ol.filtered.RData", sep=""))
+save(svm.ol.fil.boot.results, file=paste(data.path, "svm.bs.results.ol.filtered.RData", sep=""))
+save(rf.ol.fil.boot.results, file=paste(data.path, "rf.bs.results.ol.filtered.RData", sep=""))
+
+```
+
+```{r lcol filtered: feature stability over random samples}
+
+# create random samples
+xy.samples.lcol.filtered <- createRandomSample(x = protect.lcol.filtered.zeroOne, y = y.true, n.samp = 100, pcent.samp = 0.9)
+
+# register cluster for parallel computation (foreach)
+myCluster <- makeCluster(2, type = "FORK") # why "FORK"?
+registerDoParallel(myCluster)
+stopCluster(myCluster)
+
+lr.lcol.fil.boot.results <- foreach(subsamp=xy.samples.lcol.filtered, .combine = 'cbind') %dopar% {
+  x.lr <-   as.matrix(subset(subsamp, select=-c(class)))
+  y.lr <-   subsamp$class
+  lr.model       <-  cv.lr.feature.selection(x=x.lr, y=y.lr, k = "loocv", a = 0.95)
+}
+
+svm.lcol.fil.boot.results <- foreach(subsamp=xy.samples.lcol.filtered, .combine = 'cbind') %dopar% {
+  x.svm <-   as.matrix(subset(subsamp, select=-c(class)))
+  y.svm <-   subsamp$class
+  svm.model       <-  svmCVModel(x.matrix = x.svm, y.labels = y.svm, n.folds="loocv", param.grid=param.grid)
+}
+
+rf.lcol.fil.boot.results <- foreach(subsamp=xy.samples.lcol.filtered, .combine = 'cbind') %dopar% {
+  x.rf <-   as.matrix(subset(subsamp, select=-c(class)))
+  y.rf <-   subsamp$class
+  rf.model       <-  rfNFeatModel(x=x.rf, y=y.rf, n.feature = 30, ntree = 1000)
+}
+
+save(lr.lcol.fil.boot.results, file=paste(data.path, "lr.bs.results.lcol.filtered.RData", sep=""))
+save(svm.lcol.fil.boot.results, file=paste(data.path, "svm.bs.results.lcol.filtered.RData", sep=""))
+save(rf.lcol.fil.boot.results, file=paste(data.path, "rf.bs.results.lcol.filtered.RData", sep=""))
+
+```
+
+
+```{r feature stability results}
+
+load(file=paste(data.path, "lr.bs.results.unfiltered.RData", sep=""))
+load(file=paste(data.path, "svm.bs.results.unfiltered.RData", sep=""))
+load(file=paste(data.path, "rf.bs.results.unfiltered.RData", sep=""))
+
+load(file=paste(data.path, "lr.bs.results.lc.filtered.RData", sep=""))
+load(file=paste(data.path, "svm.bs.results.lc.filtered.RData", sep=""))
+load(file=paste(data.path, "rf.bs.results.lc.filtered.RData", sep=""))
+
+load(file=paste(data.path, "lr.bs.results.ol.filtered.RData", sep=""))
+load(file=paste(data.path, "svm.bs.results.ol.filtered.RData", sep=""))
+load(file=paste(data.path, "rf.bs.results.ol.filtered.RData", sep=""))
+
+load(file=paste(data.path, "lr.bs.results.lcol.filtered.RData", sep=""))
+load(file=paste(data.path, "svm.bs.results.lcol.filtered.RData", sep=""))
+load(file=paste(data.path, "rf.bs.results.lcol.filtered.RData", sep=""))
+
+```
+
+
+```{r calculate feature stabliity}
+# extracting the selected features based on the indices returned
+
+(lr.fids.unfil  = lapply(lr.boot.results["fs.idx",], function(x){colnames(protect.unfiltered.zeroOne)[x]}))
+(svm.fids.unfil = lapply(svm.boot.results["fs.idx",], function(x){colnames(protect.unfiltered.zeroOne)[x]}))
+(rf.fids.unfil  = lapply(rf.boot.results["fs.idx",], function(x){colnames(protect.unfiltered.zeroOne)[x]}))
+
+(lc.lr.fids.fil  = lapply(lr.lc.fil.boot.results["fs.idx",], function(x){colnames(protect.lc.filtered.zeroOne)[x]}))
+(lc.svm.fids.fil = lapply(svm.lc.fil.boot.results["fs.idx",], function(x){colnames(protect.lc.filtered.zeroOne)[x]}))
+(lc.rf.fids.fil  = lapply(rf.lc.fil.boot.results["fs.idx",], function(x){colnames(protect.lc.filtered.zeroOne)[x]}))
+
+(ol.lr.fids.fil  = lapply(lr.ol.fil.boot.results["fs.idx",], function(x){colnames(protect.ol.filtered.zeroOne)[x]}))
+(ol.svm.fids.fil = lapply(svm.ol.fil.boot.results["fs.idx",], function(x){colnames(protect.ol.filtered.zeroOne)[x]}))
+(ol.rf.fids.fil  = lapply(rf.ol.fil.boot.results["fs.idx",], function(x){colnames(protect.ol.filtered.zeroOne)[x]}))
+
+(lcol.lr.fids.fil  = lapply(lr.lcol.fil.boot.results["fs.idx",], function(x){colnames(protect.lcol.filtered.zeroOne)[x]}))
+(lcol.svm.fids.fil = lapply(svm.lcol.fil.boot.results["fs.idx",], function(x){colnames(protect.lcol.filtered.zeroOne)[x]}))
+(lcol.rf.fids.fil  = lapply(rf.lcol.fil.boot.results["fs.idx",], function(x){colnames(protect.lcol.filtered.zeroOne)[x]}))
+
+eNet.fids = list(lr.fids.unfil, lc.lr.fids.fil, ol.lr.fids.fil,lcol.lr.fids.fil)
+svm.fids  = list(svm.fids.unfil, lc.svm.fids.fil, ol.svm.fids.fil,lcol.svm.fids.fil)
+rf.fids   = list(rf.fids.unfil, lc.rf.fids.fil, ol.rf.fids.fil,lcol.rf.fids.fil)
+
+# calculate the z stability measure
+
+eNet.ztab = map(eNet.fids, getStabilityZucknick, C=corr.unfiltered, threshold=0.5) %>% unlist()
+svm.ztab = map(svm.fids, getStabilityZucknick, C=corr.unfiltered, threshold=0.5) %>% unlist()
+rf.ztab = map(rf.fids, getStabilityZucknick, C=corr.unfiltered, threshold=0.5) %>% unlist()
+
+```
+
+```{r calculate feature stabliity}
+
+# (lr.zstab.unfil  = getStabilityZucknick(features= lr.fids.unfil, C=corr.unfiltered, threshold=0.5))
+# (svm.zstab.unfil = getStabilityZucknick(features= svm.fids.unfil, C=corr.unfiltered, threshold=0.5))
+# (rf.zstab.unfil  = getStabilityZucknick(features= rf.fids.unfil, C=corr.unfiltered, threshold=0.5))
+# 
+# (lc.lr.zstab.fil  = getStabilityZucknick(features= lc.lr.fids.fil, C=corr.unfiltered, threshold=0.5))
+# (lc.svm.zstab.fil = getStabilityZucknick(features= lc.svm.fids.fil, C=corr.unfiltered, threshold=0.5))
+# (lc.rf.zstab.fil  = getStabilityZucknick(features= lc.rf.fids.fil, C=corr.unfiltered, threshold=0.5))
+# 
+# (ol.lr.zstab.fil  = getStabilityZucknick(features= ol.lr.fids.fil, C=corr.unfiltered, threshold=0.5))
+# (ol.svm.zstab.fil = getStabilityZucknick(features= ol.svm.fids.fil, C=corr.unfiltered, threshold=0.5))
+# (ol.rf.zstab.fil  = getStabilityZucknick(features= ol.rf.fids.fil, C=corr.unfiltered, threshold=0.5))
+# 
+# (lcol.lr.zstab.fil  = getStabilityZucknick(features= lcol.lr.fids.fil, C=corr.unfiltered, threshold=0.5))
+# (lcol.svm.zstab.fil = getStabilityZucknick(features= lcol.svm.fids.fil, C=corr.unfiltered, threshold=0.5))
+# (lcol.rf.zstab.fil  = getStabilityZucknick(features= lcol.rf.fids.fil, C=corr.unfiltered, threshold=0.5))
+
+```
+
+=================================================   Summary Data Tables   ============================================
+
+Table1: Filtered Genes
+
+```{r filtered genes proportions}
+# dataset sizes
+(protect.ds.sizes <- data.frame(model = c('Initial', 'Retained', 'Filtered'),
+                                lc.size = c(ncol(protect.unfiltered), ncol(protect.lc.filtered), ncol(protect.unfiltered)-ncol(protect.lc.filtered)), 
+                                ol.size = c(ncol(protect.unfiltered), ncol(protect.ol.filtered), ncol(protect.unfiltered)-ncol(protect.ol.filtered)),
+                                lcol.size = c(ncol(protect.unfiltered), ncol(protect.lcol.filtered), ncol(protect.unfiltered)-ncol(protect.lcol.filtered))
+                                )%>% mutate_if(is.numeric, round, digits=3)) %>% column_to_rownames(var = 'model') %>% t(.) %>% as.data.frame(.) %>% mutate(pc.filtered = Filtered/Initial * 100)
+```
+
+Table 2: Gene Filter Impact on Classification Performance
+
+```{r t test for differences in mean for svm and rf}
+
+# t-tests to determine if mean of performance metric is different
+
+(p.val.svm.lc    = t.test(unlist(results.lc.filtered$svm['f1.val',]),unlist(results.unfiltered$svm['f1.val',]), conf.level=0.95, var.equal=FALSE)$p.value)
+(p.val.svm.ol    = t.test(unlist(results.ol.filtered$svm['f1.val',]),unlist(results.unfiltered$svm['f1.val',]), conf.level=0.95, var.equal=FALSE)$p.value)
+(p.val.svm.lcol  = t.test(unlist(results.lcol.filtered$svm['f1.val',]),unlist(results.unfiltered$svm['f1.val',]), conf.level=0.95, var.equal=FALSE)$p.value)
+(p.val.rf.lc     = t.test(unlist(results.lc.filtered$rf['f1.val',]),unlist(results.unfiltered$rf['f1.val',]), conf.level=0.95, var.equal=FALSE)$p.value)
+(p.val.rf.ol     = t.test(unlist(results.ol.filtered$rf['f1.val',]),unlist(results.unfiltered$rf['f1.val',]), conf.level=0.95, var.equal=FALSE)$p.value)
+(p.val.rf.lcol   = t.test(unlist(results.lcol.filtered$rf['f1.val',]),unlist(results.unfiltered$rf['f1.val',]), conf.level=0.95, var.equal=FALSE)$p.value)
+
+```
+
+```{r classification performance}
+
+# classification performance results summary
+
+(protect.perf.results.df <- data.frame(filter = c('no filter', 'low counts', 'outlier', 'low counts outlier'),
+                                eNet = c(results.unfiltered$lr$auc.val,results.lc.filtered$lr$auc.val,results.ol.filtered$lr$auc.val,results.lcol.filtered$lr$auc.val),
+                                svm.mean = c(mean(unlist(results.unfiltered$svm['f1.val',])),mean(unlist(results.lc.filtered$svm['f1.val',])),mean(unlist(results.ol.filtered$svm['f1.val',])), mean(unlist(results.lcol.filtered$svm['f1.val',]))),
+                                svm.sd = c(sd(unlist(results.unfiltered$svm['f1.val',])), sd(unlist(results.lc.filtered$svm['f1.val',])), sd(unlist(results.ol.filtered$svm['f1.val',])), sd(unlist(results.lcol.filtered$svm['f1.val',]))),
+                                svm.pval = c('-', p.val.svm.lc, p.val.svm.ol, p.val.svm.lcol),
+                                rf.mean = c(mean(unlist(results.unfiltered$rf['f1.val',])), mean(unlist(results.lc.filtered$rf['f1.val',])), mean(unlist(results.ol.filtered$rf['f1.val',])), mean(unlist(results.lcol.filtered$rf['f1.val',]))),
+                                rf.sd = c(sd(unlist(results.unfiltered$rf['f1.val',])),sd(unlist(results.lc.filtered$rf['f1.val',])),  sd(unlist(results.ol.filtered$rf['f1.val',])),sd(unlist(results.lcol.filtered$rf['f1.val',]))),
+                                rf.pval = c('-', p.val.rf.lc, p.val.rf.ol, p.val.rf.lcol)) %>% mutate_if(is.numeric, round, digits=5))
+
+```
+
+Table 3: Gene Filter Impact on Feature Stability
+
+```{r feature stability impact}
+
+# feature stability results summary
+
+(protect.stab.results.df <- data.frame(filter = c('no filter', 'low counts', 'outlier', 'low counts outlier'),
+                                eNet.fs = map(eNet.fids,createBinaryMatrix,colnames(protect.unfiltered.zeroOne)) %>% map(rowSums) %>% map(mean) %>% unlist(),
+                                eNet.sb = eNet.ztab, 
+                                svm.fs = map(svm.fids,createBinaryMatrix,colnames(protect.unfiltered.zeroOne)) %>% map(rowSums) %>% map(mean) %>% unlist(),
+                                svm.sb = svm.ztab,
+                                rf.fs = map(rf.fids,createBinaryMatrix,colnames(protect.unfiltered.zeroOne)) %>% map(rowSums) %>% map(mean) %>% unlist(),
+                                rf.sb = rf.ztab
+                                )%>% mutate_if(is.numeric, round, digits=3))
+
+```
+
+
+```{r OLD dataframes for paper results tables}
+# dataset sizes
+# (protect.ds.sizes <- data.frame(model = c('Initial', 'Retained', 'Filtered'),
+#                                 lc.size = c(ncol(protect.unfiltered), ncol(protect.lc.filtered), ncol(protect.unfiltered)-ncol(protect.lc.filtered)), 
+#                                 ol.size = c(ncol(protect.unfiltered), ncol(protect.ol.filtered), ncol(protect.unfiltered)-ncol(protect.ol.filtered)),
+#                                 lcol.size = c(ncol(protect.unfiltered), ncol(protect.lcol.filtered), ncol(protect.unfiltered)-ncol(protect.lcol.filtered))
+#                                 )%>% mutate_if(is.numeric, round, digits=3)) %>% t(.)
+
+# classification performance results summary
+(protect.perf.results.df <- data.frame(model = c('LR', 'SVM', 'RF'),
+                                unfil.mean.score    = c(results.unfiltered$lr$auc.val,    mean(unlist(results.unfiltered$svm['f1.val',])),   mean(unlist(results.unfiltered$rf['f1.val',]))),
+                                lc.fil.mean.score   = c(results.lc.filtered$lr$auc.val,   mean(unlist(results.lc.filtered$svm['f1.val',])),  mean(unlist(results.lc.filtered$rf['f1.val',]))),
+                                ol.fil.mean.score   = c(results.ol.filtered$lr$auc.val,   mean(unlist(results.ol.filtered$svm['f1.val',])),  mean(unlist(results.ol.filtered$rf['f1.val',]))),
+                                lcol.fil.mean.score = c(results.lcol.filtered$lr$auc.val, mean(unlist(results.lcol.filtered$svm['f1.val',])),mean(unlist(results.lcol.filtered$rf['f1.val',]))),
+                                unfil.sd    = c(0, sd(unlist(results.unfiltered$svm['f1.val',])),   sd(unlist(results.unfiltered$rf['f1.val',]))),
+                                lc.fil.sd   = c(0, sd(unlist(results.lc.filtered$svm['f1.val',])),  sd(unlist(results.lc.filtered$rf['f1.val',]))),
+                                ol.fil.sd   = c(0, sd(unlist(results.ol.filtered$svm['f1.val',])),  sd(unlist(results.ol.filtered$rf['f1.val',]))),
+                                lcol.fil.sd = c(0, sd(unlist(results.lcol.filtered$svm['f1.val',])),sd(unlist(results.lcol.filtered$rf['f1.val',])))
+                                ) %>% mutate_if(is.numeric, round, digits=3))
+
+t(protect.perf.results.df)
+save(protect.perf.results.df, file=paste(data.path, "protect.results.df.RData", sep=""))
+
+# feature stability results summary
+(protect.stab.results.df <- data.frame(model = c('LR', 'SVM', 'RF'),
+                                unfil.stab = c(lr.zstab.unfil, svm.zstab.unfil, rf.zstab.unfil), 
+                                lc.fil.stab = c(lc.lr.zstab.fil,lc.svm.zstab.fil,lc.rf.zstab.fil),
+                                ol.fil.stab = c(ol.lr.zstab.fil,ol.svm.zstab.fil,ol.rf.zstab.fil),
+                                lcol.fil.stab = c(lcol.lr.zstab.fil,lcol.svm.zstab.fil,lcol.rf.zstab.fil)
+                                )%>% mutate_if(is.numeric, round, digits=3))
+t(protect.stab.results.df)
+```
+
+
+```{r  save output tables}
+
+save(protect.perf.results.df, file=paste(data.path, "protect.perf.results.df.RData", sep=""))
+save(protect.stab.results.df, file=paste(data.path, "protect.stab.results.df.RData", sep=""))
+
+```
+
+============================================================================================================
+########################### Selection Frequency: Graphical Illustration ####################################
+============================================================================================================
+
+### create a function to produce the dataframes for the outputs of each model - lr, svm, rf, and
+### create plot that produces a 2 x 3 matrix of plots - showing row of lc retained, and row of ol retained, going lr, svm, rf left to right
+### just one legend on the plot - passes filter, filtered out
+### figure out a graphic that combines all three models, and both low count and outlier frequency - could be combined to make
+### the paper much more concise / succinct. more a 'perspective' type paper
+### currently the charts are produced by manually changing the variables - find automated way to plot all the charts
+
+```{r selection frequency of low count and outlier filtered genes by models using unfiltered data}
+
+# create binary gene selection matrix from the boostrap output
+lr.sel.matrix = createBinaryMatrix(lr.fids.unfil, colnames(protect.unfiltered)) # change to colnames of the filtered dataset
+svm.sel.matrix = createBinaryMatrix(svm.fids.unfil, colnames(protect.unfiltered)) # change to colnames of the filtered dataset
+rf.sel.matrix = createBinaryMatrix(rf.fids.unfil, colnames(protect.unfiltered)) # change to colnames of the filtered dataset
+
+# logical vectors on whether genes passes the lc and ol filters
+idx.lc  <-  colnames(protect.unfiltered) %in% colnames(protect.lc.filtered)
+idx.ol <- colnames(protect.unfiltered) %in% colnames(protect.ol.filtered)
+
+# all(idx.lc == apply(normalisedCounts.nozeros, 1, function(x){sum(x > 60) >= 1}))   # check the lc logical is correct
+
+# create sorted data from with frequency of feature selection at the given noise threshold and retained / filtered vector 
+
+sel.freq.df <- data.frame('ensemblID' = colnames(protect.unfiltered),
+                                             'lr.sel.freq' = colSums(lr.sel.matrix),
+                                              'svm.sel.freq' = colSums(svm.sel.matrix),
+                                              'rf.sel.freq' = colSums(rf.sel.matrix),
+                                              'lc.retained' = idx.lc,               
+                                              'ol.retained' = idx.ol)
+
+                          
+# # summary statistics on gene selection
+# # calculate the number of low count features selected at least once
+# (n.lc.sel <- length(sel.freq.df$lc.retained) - sum(sel.freq.df$lc.retained))
+# (pc.lc.sel <- n.lc.sel/length(sel.freq.df$lc.retained)*100)
+# print(paste('The number of low count features selected at least once: ', n.lc.sel, sep=''))
+# print(paste('The % of selected genes labelled as low count: ', pc.lc.sel, sep=''))
+# names(sel.freq.df)
+
+# look at the names of the genes selected with high frequency
+# (gene.names.filtered <- dplyr::filter(ensembl_all_genes, Gene.stable.ID %in% sel.freq.df$ensemblID))
+
+
+```
+
+===============================================   Results Plots   ============================================
+
+```{horizontal bar plot with totals}
+
+sel.freq.df.bar = sel.freq.df %>% mutate(low.counts = sel.freq * lc.retained,
+                                          outliers = sel.freq * ol.retained) %>% 
+                                    dplyr::select(sel.freq, low.counts, outliers)
+lc.filt = colSums(sel.freq.df.bar)['sel.freq'] - colSums(sel.freq.df.bar)['low.counts']
+lc.retained = colSums(sel.freq.df.bar)['low.counts']
+ol.filt = colSums(sel.freq.df.bar)['sel.freq'] - colSums(sel.freq.df.bar)['outliers']
+ol.retained = colSums(sel.freq.df.bar)['outliers']
+colSums(sel.freq.df.bar)
+
+sel.freq.summary = data.frame(retained = c(lc.retained, ol.retained),
+                              filtered = c(lc.filt, ol.filt),
+                              row.names = c('Low Counts', 'Outliers')) %>%
+  rownames_to_column(var = 'filter') %>% 
+  melt(value.name = 'count', id = 'filter')
+
+
+ggplot(data=sel.freq.summary) +
+    geom_bar(aes(x=filter, y = count, fill=variable), stat='identity') +
+    xlab("filter") + 
+    ylab("Selection Count") + 
+    coord_flip() +
+    scale_fill_discrete(name = "Filter Result", labels = c("TRUE" = "Retained", "FALSE" = "Filtered"), guide = guide_legend(reverse=TRUE)) +
+    theme(
+      #legend.background = element_rect(fill = "white", size = 6, colour = "white"),
+      legend.text=element_text(size=10),
+      legend.title = element_text(size=10),
+      axis.ticks = element_line(colour = "grey70", size = 0.2),
+      axis.text = element_text(size = 18),
+      axis.text.x=element_blank(),
+      axis.title.x = element_text(size = 18),
+      axis.title.y = element_text(size = 18),
+      panel.grid.major = element_line(colour = "grey70", size = 0.2),
+      panel.grid.minor = element_blank(),
+      legend.position = c(0.8, 0.8))
+```
+
+
+```{r frequency plot function}
+
+# function to create frequency bar chart, for different model and filter combinations
+
+freqencyPlotFun <- function(selection.frequency.dataframe, model, filter){
+
+  # enquote colunn variables
+  model <- enquo(model) 
+  filter <- enquo(filter) 
+  
+  # bar chart of gene selection frequency highlighting the 'noisy' low read count genes
+  data.frame.sorted <- selection.frequency.dataframe %>% dplyr::filter((!!model) >0) %>%
+      dplyr::group_by(-(!!filter)) %>%
+      dplyr::arrange(desc((!!model)), .by_group = TRUE)
+    
+  # make ensemblID an ordered factor based on the updated sort order
+  data.frame.sorted$ensemblID <- factor(data.frame.sorted$ensemblID, levels = data.frame.sorted$ensemblID)
+  
+  plot <- ggplot(data.frame.sorted) +
+    geom_bar(aes(x=ensemblID, y = (!!model), group=(!!filter), fill=(!!filter)), stat='identity') +
+    xlab("Gene") +
+    ylim(0,100) +
+    scale_fill_discrete(name = element_blank(), labels = c("TRUE" = "Retained", "FALSE" = "Filtered"), guide = guide_legend(reverse=TRUE))+
+    theme_minimal() +
+    theme(
+      legend.text=element_text(size=10),
+      legend.title = element_text(size=10),
+      axis.ticks = element_line(colour = "grey70", size = 0.2),
+      axis.ticks.x = element_blank(),
+      axis.text = element_text(size = 18),
+      axis.text.x=element_blank(),
+      axis.title.x = element_text(size = 18),
+      axis.title.y = element_blank(),
+      panel.grid.major = element_line(colour = "grey70", size = 0.2),
+      panel.grid.minor = element_blank(),
+      legend.position = c(0.85, 0.85),
+      panel.grid.major.x = element_blank()
+  )
+
+return(plot)
+}
+
+# freqencyPlotFun(sel.freq.df, lr.sel.freq, lc.retained)
+
+```
+
+
+```{r create triplet plots and save as PDF}
+
+# multiple plots for low counts filter: for paper
+
+(lc.sel.freq.triplet.plot <- plot_grid(freqencyPlotFun(sel.freq.df, lr.sel.freq, lc.retained),
+                                       freqencyPlotFun(sel.freq.df, svm.sel.freq, lc.retained),
+                                       freqencyPlotFun(sel.freq.df, rf.sel.freq, lc.retained),
+                                       labels = c("LR", "SVM", "RF"), ncol = 3, hjust = -3,vjust = 4))
+
+(ol.sel.freq.triplet.plot <- plot_grid(freqencyPlotFun(sel.freq.df, lr.sel.freq, ol.retained),
+                                       freqencyPlotFun(sel.freq.df, svm.sel.freq, ol.retained),
+                                       freqencyPlotFun(sel.freq.df, rf.sel.freq, ol.retained),
+                                       labels = c("LR", "SVM", "RF"), ncol = 3, hjust = -3,vjust = 4))
+
+ggsave(filename = "lc.sel.freq.triplet.plot.pdf", plot = lc.sel.freq.triplet.plot, device = 'pdf', width = 30, heigh = 10, units = "cm", dpi = 1200, path = paste(figs.path, "feature_selection/", sep=""))
+
+ggsave(filename = "ol.sel.freq.triplet.plot.pdf", plot = ol.sel.freq.triplet.plot, device = 'pdf', width = 30, heigh = 10, units = "cm", dpi = 1200, path = paste(figs.path, "feature_selection/", sep=""))
+
+```
+
+
+============================================================================================================
+###################################### Testing Final ML Functions ##########################################
+============================================================================================================
+
+```{r}
+### libraries not used in final implementation, only in testing code at the bottom
+#library(kernlab)      # alternative package for svms, caret uses rbf kenrla svm from kernlab
+#library(penalizedSVM) # package that implements L1 penalised SVM
+#library(caret)        # package for rfe - recursive feature elimination
+#library(rsample)      # for easy creation of cross validation groups
+#library(doMC)         # enables parallelisation of cores
+```
+
+Error encountered during testing and solutions
+
+1. empty values for f1, accuracy. A result not being able to calculate the max for f1.score, given there are NA values for f1.score for some values of lamda. solution was to add the na.rm = TRUE to the max() functio when selecting the best f1.score
+2. The following error message on running:  (test.restuls.svm <- cv.svm.model(x.mat[1:39,], y.true[1:39], n.folds, param.grid, max.features))
+
+Error in h(simpleError(msg, call)) : 
+error in evaluating the argument 'x' in selecting a method for function 'as.data.frame': error in evaluating the argument 'args' in selecting a method for function 'do.call': Wrong number of classes ( < 2 ).
+
+This was a result of not setting the n.folds parameter explicitly in the function, and it was picking a previous value (45) that was larger than the size of the matrix. Resolved by setting n.folds = "loocv" in the function argument
+
+3. The following error message on running 
+
+Error in { : 
+task 1 failed - "unused arguments (x.matrix = x.boots, y.labels = y.boots)"
+
+This was a result of not first registering the parallel back end
+
+4. Updated versions of functions not saving
+Fixed by clearing the environment, and starting again. May have something to do with working on multiple clusters, and the updated versions of parameters and functions not updating across the clusters. Need to look up to understand this.
+
+```{r testing svm cv functions}
+
+# inputs
+(x.mat = apply(test.datasets[[4]], 2, normalize))
+(y.true = factor(targets$svm.class, levels=c(1, -1)))
+n.folds = 'loocv'
+#inner_k="loocv"
+num.boots = 2
+
+# create parameter grid for the lambda values
+param.grid <-vector(); for (num in c(1, 2.5, 5, 7.5)) param.grid<-sort(c(param.grid, c(num*10^seq(-2, 0, 1 ))) )
+param.grid <- as.list(param.grid)
+param.grid
+
+# test create fold dataframe
+test.fold.df <- createFoldDataFrame(n.folds=length(y.true), x.mat, y.true)
+print(paste("The number of folds created is:  ", length(test.fold.df[[1]]), sep=""))
+print(paste("The dimensions of train matrix in each fold are: ", dim(test.fold.df[[1]][[1]])[1], " by ", dim(test.fold.df[[1]][[1]])[2], sep=""))
+colnames(test.fold.df) # check column names of the dataframe produced
+for(i in test.fold.df[,1]){print(dim(i))} # check that the x.train, y.train etc. components have the expected dimensions
+
+# test the train, predict function will make a prediction on all the folds in a dataset
+for(i in 1:length(y.true)){
+test.pred <- svmTrainPredict(x.train = test.fold.df[,1][[i]],
+                              y.train = test.fold.df[,2][[i]],
+                              x.val =   test.fold.df[,3][[i]],
+                              lambda = 1)
+print(test.pred)}
+
+# test the full penalised cross validation will run over the whole folds dataframe
+svmPcv.test.results <- svmPenalisedCV(lambda1 = 1,
+               svm.cv.folds.df = test.fold.df,
+               x.mat = x.mat,
+               y.true = y.true)
+svmPcv.test.results
+(svmPcv.test.results$f1.score)
+
+# scale test data between 0 and 1
+test.dataset.scale <- apply(test.datasets[[1]], 2, normalize)
+
+# run the svm model, without bootstrapping - gives the performance (f1.score)
+(test.results.svm <- svmCVModel(test.dataset.scale, targets$svm.class, n.folds="loocv", param.grid=param.grid))
+print(str_glue('F1 score for the model:  {round(test.results.svm$f1.val,4)}'))    # str_glue works like python f strings, from stringr package
+
+(test.results.svm <- svmCVModel(test.dataset.scale[1:30,], targets$svm.class[1:30], n.folds="loocv", param.grid=param.grid))
+```
+
+```{r testing logistic regression cv functions}
+
+# run the lr model, without bootstrapping - gives the performance (AUC)
+(test.results.lr  <- cv.lr.feature.selection(x=test.dataset.scale, y=targets$svm.class, k = "loocv", a = 0.95))
+print(str_glue('AUC score for the model:  {round(test.results.lr$auc.val,4)}'))    # str_glue works like python f strings, from stringr package
+
+```
+
+Random forest testing
+
+# hyper parameters
+mtry - number of variables randomly sampled as candidates at each split. This is defaulted to sqrt(p). May want to reduce for large p
+ntree - number of trees to grow. default is 500. may want to increase this.
+maxnodes - maximum number of terminal nodes
+nodesize - minimum size of terminal nodes. this is set as default 1 for classification
+
+```{r testing rf functions}
+
+# inputs
+(x.mat = apply(test.datasets[[4]], 2, normalize))
+(y.true = factor(targets$svm.class, levels=c(1, -1)))
+
+# basic running of random forest model, with defaults for the tunable parameters
+(rf.test <- randomForest(x = x.mat, y = y.true, importance=TRUE))
+rf.test
+
+# get the prediections on the out of bag samples - average prediction for each sample over all models where it was out of bag
+rf.pred = predict(rf.test, type='response', drop=FALSE)
+rf.pred
+cm.rf.test = caret::confusionMatrix(data = rf.pred, reference = y.true)
+cm.rf.test
+rf.cm.perf.metrics <- cm.rf.test$byClass[c('Sensitivity', 'Specificity', 'Precision', 'F1')]
+(f1 = cm.rf.test$byClass['F1'])
+(sensitivity = cm.rf.test$byClass['Sensitivity'])
+(specificity = cm.rf.test$byClass['Specificity'])
+(precision = cm.rf.test$byClass['Precision'])
+
+# variable importance, just pull out the gini base measure
+importance(rf.test)[, c('MeanDecreaseGini'), drop=FALSE]
+
+# cross validation for the optimum number of features
+rfcv.test = rfcv(trainx = x.mat, trainy = y.true, cv.fold=length(y.true), recursive = TRUE)
+# rfcv.test
+
+# get the performance scores for each number of features tested
+rf.cv.res <-map_dfr(rfcv.test$predicted, function(x){caret::confusionMatrix(y.true, x)$byClass[c('Sensitivity', 'Specificity', 'Precision', 'F1')]})
+rf.cv.res$n.features <- as.integer(unlist(names(rfcv.test$predicted)))
+
+# determine best hyperparameters and corresponding accuracy score, using number of features and accuracy to decide
+rf.cv.res.fil <- rf.cv.res %>%
+
+  dplyr::filter(F1 == max(F1, na.rm = TRUE)) %>%     # filter to best classification performance, remove NAs
+  dplyr::filter(n.features == min(n.features))                           # get minimum value of lambda, most regularised, for given performance => single line of results
+
+(best.n.features = rf.cv.res.fil$n.features)
+
+# retrain a model without cross validation, and extract the n.features with the top feature importance
+
+# basic running of random forest model, with defaults for the tunable parameters
+(rf.retrain <- randomForest(x = x.mat, y = y.true, importance=TRUE))
+
+# variable importance, just pull out the gini base measure
+(rf.feat.imp <- importance(rf.retrain)[, c('MeanDecreaseGini'), drop=FALSE] %>% as.data.frame(.) %>% arrange(., desc(MeanDecreaseGini)))
+
+# get the feature names of the best.n.features based on ranked mean decrease in gini coefficient
+(best.features <- rownames(rf.feat.imp[1:29,, drop=FALSE]))
+
+# get the index of the selected features based on the original feature set
+(fs.idx = which(colnames(x.mat) %in% best.features))
+
+# tune the mtry parameter - built in hyper parameter tuning in R
+# stepFactor is the % up and down is searches from the starting value of mtry. mytryStart set at the sqrt of the number of params in the dataset.
+# if mtry = p, then it is bagging, not a random forest - there is no random set of variables used to build each tree
+tuneRF(x=x.mat, y.true, mtryStart=sqrt(ncol(x)), ntreeTry=50, stepFactor=1.25, improve=0.05,trace=TRUE, plot=TRUE, doBest=FALSE)
+
+# testing the rfNFeatModel functions
+rfNFeatModel(x = test.datasets[[1]], y = y.true, n.feature = 30, ntree=1000)
+
+# testing the rfRFEModel functions
+rfRFEModel(test.datasets[[4]], y.true, "loocv", ntree=1000)
+rfRFEModel(test.datasets[[1]], y.true, "loocv", ntree=1000)
+
+#  oob error vs. the number of trees to determine an appropriate number of trees where error has stabilised, 500 or more?
+
+n.trees.grid = c(100, 200, 300, 500, 1000, 1500, 2000)
+map(n.trees.grid, rfNFeatModel, x.matrix = test.datasets[[2]], y.labels=y.true, n.folds = "loocv")
+
+```
+
+```{r rfe with random forest with caret}
+
+#rfe with caret
+#https://towardsdatascience.com/effective-feature-selection-recursive-feature-elimination-using-r-148ff998e4f7
+
+# create rfe control object
+
+rfe.control <- rfeControl(functions = rfFuncs,
+                   rerank = FALSE,
+                   method = "LOOCV", #cross validation
+                   verbose = FALSE, #prevents copious amounts of output from being produced.
+                   allowParallel = TRUE)
+
+# create train control object
+
+trainctrl <- trainControl(method = "LOOCV",
+                          savePredictions = 'all')
+
+# create grid of svm regularlisation parameters to tune the svm model on at each iteration
+# parameter names depends on the kernal, and therefore the underlying package supplying the svm model (e1071 / kernlab)
+
+#rf.grid <-  ??
+
+## RFE procedure using cross validation, takes some of the arguments of the train function - acts like train.
+# trControl, method, and tuneGrid are arguments to the train function, that are passed to train
+# sizes are the different size of the feature subsets to test: test with a single subset for performance
+# using a linear kernal, 'svmLinear2' uses the e1071 function, with parameter 'cost'
+# using an rbf kernal, uses 'svmRadial' from the kernlab package, with parameters C and sigma
+# set just one subset
+
+rf.rfe.fit <- rfe(x = x.mat,
+                   y = y.true,
+                   sizes = c(10:20, 30, 40, 50), 
+                   rfeControl = rfe.control,
+                   metric = "ROC",
+                   method = 'rf')#,          
+                   #trControl = trainctrl)
+
+ # details of the rfe - with the selected number of variables from the list of subsets
+
+rf.rfe.fit
+
+## details of all of the relevant slots in the rft fit object ##
+
+## the performance results for each number of variables
+rf.rfe.fit$results
+
+# two ways to get the names of the features selected by the best model
+rf.rfe.fit$optVariables
+predictors(rf.rfe.fit)
+
+# view the ranking of variables in each subset size, over the folds
+rf.rfe.fit$variables
+
+```
+
+```{r testing random sampling + feature stability with all three models}
+
+# testing creating random samples
+
+xy.samples <- createRandomSample(x = test.datasets[[1]], y = y.true, n.samp = 10, pcent.samp = 0.9)
+for(i in xy.samples){print(dim(i))}
+
+# testing using foreach to fit models to the set of random samples
+
+
+# register cluster for parallel computation (foreach)
+myCluster <- makeCluster(8, type = "FORK") # why "FORK"?
+registerDoParallel(myCluster)
+stopCluster(myCluster)
+
+# run parallel for svm results
+
+# create parameter grid for the lambda values
+param.grid <-vector(); for (num in c(1, 5)) param.grid<-sort(c(param.grid, c(num*10^seq(-2, 1, 1))) )
+(param.grid <- as.list(param.grid))
+
+
+svm.boot.results <- foreach(subsamp=xy.samples, .combine = 'cbind') %dopar% {
+
+  # split out the feature matrix and class labels as model inputs
+  x.svm <-   as.matrix(subset(subsamp, select=-c(class)))
+  y.svm <-   subsamp$class
+
+  # fit cv model and return f1 score and selected features matrix
+  svm.model       <-  svmCVModel(x.matrix = x.svm, y.labels = y.svm, n.folds="loocv", param.grid=param.grid)
+
+}
+
+# run parallel for logistic regression results
+
+lr.boot.results <- foreach(subsamp=xy.samples, .combine = 'cbind') %dopar% {
+  
+  # split out the feature matrix and class labels as model inputs
+  x.lr <-   as.matrix(subset(subsamp, select=-c(class)))
+  y.lr <-   subsamp$class
+
+  # fit cv model and return f1 score and selected features matrix
+  lr.model       <-  cv.lr.feature.selection(x=x.lr, y=y.lr, k = "loocv", a = 0.95)
+
+}
+
+ 
+# run parallel for random forest results
+
+rf.boot.results <- foreach(subsamp=xy.samples, .combine = 'cbind') %dopar% {
+  
+  # split out the feature matrix and class labels as model inputs
+  x.rf <-   as.matrix(subset(subsamp, select=-c(class)))
+  y.rf <-   subsamp$class
+
+  # fit cv model and return f1 score and selected features matrix
+  rf.model       <-  rfNFeatModel(x=x.rf, y=y.rf, n.feature = 30, ntree = 1000)
+
+}
+
+# extracting the selected features based on the indices returned
+
+svm.fids = lapply(svm.boot.results["fs.idx",], function(x){colnames(test.datasets[[1]])[x]})
+lr.fids = lapply(lr.boot.results["fs.idx",], function(x){colnames(test.datasets[[1]])[x]})
+rf.fids = lapply(rf.boot.results["fs.idx",], function(x){colnames(test.datasets[[1]])[x]})
+
+svm.fids
+lr.fids
+rf.fids
+
+# get the correlation matrix, and add back the row and column names
+C.test.scale <- scaleCorrelationCoop(test.datasets[[1]])
+
+# calculate the stability for the svm and lr ids
+(svm.test.zstab = getStabilityZucknick(features= svm.fids, C=C.test.scale, threshold=0.5))
+(lr.test.zstab = getStabilityZucknick(features= lr.fids, C=C.test.scale, threshold=0.5))
+(rf.test.zstab = getStabilityZucknick(features= rf.fids, C=C.test.scale, threshold=0.5))
+
+```
+
+
+============================================================================================================
+#################################### glmnet Library Testing ###################################
+============================================================================================================
+
+Initial testing to understand the functions in the glmnet package
+
+```{r understanding glmnet}
+
+# testing basic functions and outputs
+
+# fit simple elastic net model, with relaxed = TRUE
+cv.model.fit <- cv.glmnet(xe[15:50,], ye[15:50], family='binomial', alpha=0.05, relax=TRUE, type.measure = 'class', nfolds = 35, grouped=FALSE, keep = TRUE)
+plot(cv.model.fit)
+print(cv.model.fit, s=0, gamma=0)
+cv.model.fit$fit.preval$`g:0`
+
+testing.results <- cv.lr.model.testing(x=xe[15:50,],y=ye[15:50],k=35,a=0.95,n.features=NULL)
+
+cv.model.fit$relaxed
+# predict on test data
+predict(cv.model.fit, newx = xe[c(0:14,51:62),], s = 'lambda.1se', gamma = 0)
+
+# print the list of all lambdas and number of variables selected for each lambda
+print(model.fit)
+
+# if you call coef without specifying a lambda, then you get the coefficients for every lambda
+coef(model.fit) 
+
+# fit cross validated model using loocv and mis classification error as loss
+cvfit <- cv.glmnet(t(vstCounts.ibd),
+                   sampleInfo_ibd$condition,
+                   family='binomial',
+                   alpha=0.95,
+                   type.measure = 'class',
+                   nfolds = 10,
+                   grouped=FALSE,
+                   keep = TRUE)
+
+# see all the lambda values used
+cvfit$lambda
+
+# get the best lambdas based on standard definitions
+cvfit$lambda.1se
+cvfit$lambda.min
+
+# error at each lambda
+cvfit$cvm
+
+# number of features at each lambda
+cvfit$nzero
+
+# the predictions on the validation set (requires keep = TRUE)
+cvfit$fit.preval
+
+# a fitted model based on the full data - i.e. call glmnet on all the data
+cvfit$glmnet.fit
+
+# get the coefficients from the fitted glmnet object, at the best lambda
+sel.coefs <- coef(cvfit$glmnet.fit, s=cvfit$lambda.1se)
+
+
+```
+
+============================================================================================================
+############################## Alternative SVM Library Testing #############################################
+============================================================================================================
+
+## source information + notes on implementation
+
+1. svm packages, and model workflows
+carat: https://cran.r-project.org/web/packages/caret/caret.pdf
+svm() in e1071: https://rpubs.com/cliex159/865583
+packages: carat, kernlab (kernal based ML algos), e1071 (various algos, includes svms)
+source: https://www.machinelearningplus.com/machine-learning/feature-selection/
+caret worked examples: https://www.machinelearningplus.com/machine-learning/caret-package/
+kernlab model alternatives: https://rpubs.com/mgilbert/SVM_Toy_Example
+
+LiblineaR - fast solver for linear SVM implementation
+
+https://www.csie.ntu.edu.tw/~cjlin/liblinear/FAQ.html
+https://www.jmlr.org/papers/volume11/yuan10c/yuan10c.pdf - paper from the creators of Liblinear and LibSVM
+Alternative package for fast calculation with linear kernels and L1 and L2 cost functions
+https://cran.r-project.org/web/packages/LiblineaR/index.html 
+
+Initially tested with a rbf kernal, using method = 'svmRadialCost' - caret implementation of rbf svm from kernlab package
+Run time on this simple model was 4-5 hours, with no optimisation of hyper param
+Switched to linear kernal with kernlab, method = 'svmLinear'
+Also tested method = 'svmRadial' that optimises over cost and sigma - appeared to predict sepsis in every case - poorly performing model. Maybe an issue with tuning the signa param with such a small number of exampels?
+
+1. rfe implementation
+
+two class summary information - can be used to calculate AUC - https://stackoverflow.com/questions/58216921/how-to-pass-arguments-to-twoclasssummary-in-caret-package
+
+model workflow
+https://towardsdatascience.com/effective-feature-selection-recursive-feature-elimination-using-r-148ff998e4f7
+
+notes:
+set the rfe.control variable, including the caretFuncs functions, to allow selection of custom model
+set the summary functions in caretFuncs to use the two class summary that includes roc, specificity and sensivity
+https://www.rdocumentation.org/packages/caret/versions/6.0-80/topics/rfeControl
+https://stackoverflow.com/questions/21088825/feature-selection-in-caret-rfe-sum-with-roc
+https://stackoverflow.com/questions/51933704/feature-selection-with-caret-rfe-and-training-with-another-method
+https://www.rdocumentation.org/packages/caret/versions/6.0-92/topics/trainControl
+
+explains how the final set of variables is arrived at: https://github.com/topepo/caret/issues/487
+explains why the max iterations error arrises from kernlab: https://github.com/topepo/caret/issues/425
+explains that variable importances for svms in carat (kernlab) are based on univariate ROC curves for each variable...https://stat.ethz.ch/pipermail/r-help/2010-October/257627.html
+
+Basically, the hyperparameter optimisation happens for every model that is evaluated, so the initial model with all features, and then all the feature subsets. The final feature subset is obtained by training and tuning a model on all the training data (no-cross validation), using the selected optimisal number of hyper parameters - the selected features are the x best features based on this final model train.
+
+
+3. class imbalance
+
+consider subsampling for class imbalances:
+https://topepo.github.io/caret/subsampling-for-class-imbalances.html
+
+
+======================================== Package: LiblineaR ==============================================
+
+```{r testing LiblineaR package}
+
+svm.ll.res <- LiblineaR(
+                        data = x.mat,
+                        target = y.true,
+                        type = 5,
+                        cost = 1,
+                        epsilon = 0.01,
+                        svr_eps = NULL,
+                        bias = 1,
+                        wi = NULL,
+                        cross = FALSE,
+                        verbose = FALSE,
+                        findC = FALSE,
+                        useInitC = TRUE
+)
+predict(svm.ll.res, test.datasets[[4]], proba = FALSE, decisionValues = FALSE)$predictions == y.true
+```
+
+======================================== Package: PenalisedSVM ==============================================
+
+Issues with this package: complex implementation. Unclear exactly what is going on under the hood
+The DrHSVM function implements elastic net - selected very few features in each iteration, and gave same
+mis-classification error for multiple values of lambda
+
+L1 implementation resulted in a high number of features. No ability to optimise for lower number of features
+where multiple lambda values gave same cross validation error
+
+Implementation uses Libsvm which is a slower solver in the case of linear models than Liblinear
+
+```{r testing PenalisedSVM package}
+
+help("penalizedSVM")
+
+# use the sim.data function in the PenalizedSVM package to create simulated microarray data
+# n samples, # ng genes, #nsg significant genes
+# output has genes in rows, and samples in colunns - i.e. need to transpose to input into ML classifier
+seed <- 123
+train<-sim.data(n = 200, ng = 100, nsg = 10, corr=FALSE, seed=12)
+train$x
+print(str(train))
+train$y
+
+# set bounds for the interval search for lambda
+bounds=t(data.frame(log2lambda1=c(-10, 10)))
+colnames(bounds)<-c("lower", "upper")
+
+
+# train with svmfs
+svm.res <- svmfs(x = t(train$x),
+      y = train$y,
+      fs.method = 'DrHSVM',
+      bounds = bounds,
+      cross.outer = 0,
+      grid.search = 'interval',    # optimisation with gaussian process
+      maxIter = 700,
+      inner.val.method = 'cv',
+      cross.inner = 5,
+      maxevals = 500,
+      seed = seed,
+      params.coding = 'log2',
+      show = 'none',    # show plots of the interval search
+      verbose = FALSE)
+
+# elements of the output model
+svm.res$model
+
+# print elements of the final model
+print(svm.res$model)
+
+# indices of the selected features
+svm.res$model$xind
+
+# the cross valuation error for the optimal value of lambda
+svm.res$model$q.val
+
+# fit.info has the information about the tuning of the hyper parameter (lambda values, error for each lambda)
+svm.res$model$fit.info
+
+print(paste("minimal 5-fold cv error:", svm.res$model$fit.info$fmin,
+            "by log2(lambda1)=", svm.res$model$fit.info$xmin))
+
+
+print(" all lambdas with the same minimum? ")
+print(svm.res$model$fit.info$points.fmin)
+
+# number of values of lambda tested in the gaussian process
+print(paste(svm.res$model$fit.info$neval, "visited points"))
+
+print(" overview: over all visitied points in tuning parameter space with corresponding cv errors")
+print(data.frame(Xtrain=svm.res$model$fit.info$Xtrain,
+                  cv.error=svm.res$model$fit.info$Ytrain))
+
+.plot.EPSGO.parms(svm.res$model$fit.info$Xtrain, svm.res$model$fit.info$Ytrain,
+bound=bounds, Ytrain.exclude=10^16, plot.name=NULL )
+
+# the value of lambda - inverse log2
+lambda1 <- svm.res$model$fit.info$model.list$model$lambda1
+
+# nu parameter (between zero and 1)
+svm.res$model$fit.info$model.list$model$nu
+
+
+# train data with lpsvm
+#model <- lpsvm(A=t(train$x), d=train$y, k=5, nu=0,output=0, delta=10^-3, epsi=0.001, seed=12)
+#print(model)
+#print(str(model))
+
+############### using the test dataset ###################3
+
+datasets.noise.protect[[23]]
+dim(test.datasets[[4]])
+# testing the l1 norm function
+
+# set bounds for the interval search for lambda
+bounds=t(data.frame(log2lambda1=c(-10, 10)))
+colnames(bounds)<-c("lower", "upper")
+
+# train with svmfs
+svm.res <- svmfs(x = test.datasets[[1]],
+      y = targets$svm.class,
+      fs.method = '1norm',         # L1 norm SVM
+      bounds = bounds,
+      cross.outer = 0,
+      grid.search = 'interval',    # optimisation with gaussian process
+      maxIter = 100,
+      inner.val.method = 'cv',
+      cross.inner = 45,
+      maxevals = 500,
+      seed = seed,
+      params.coding = 'log2',
+      show = 'none',    # show plots of the interval search
+      verbose = FALSE)
+
+# elements of the output model
+svm.res$model
+
+# print elements of the final model
+print(svm.res$model)
+
+# indices of the selected features
+svm.res$model$xind
+
+# the cross valuation error for the optimal value of lambda
+svm.res$model$q.val
+
+# identify the minimum cross validation error
+print(paste("minimal 5-fold cv error:", svm.res$model$fit.info$fmin,
+            "by log2(lambda1)=", svm.res$model$fit.info$xmin))
+
+
+print(" all lambdas with the same minimum? ")
+print(svm.res$model$fit.info$points.fmin)
+
+# number of values of lambda tested in the gaussian process
+print(paste(svm.res$model$fit.info$neval, "visited points"))
+
+print(" overview: over all visitied points in tuning parameter space with corresponding cv errors")
+print(data.frame(Xtrain=svm.res$model$fit.info$Xtrain,
+                  cv.error=svm.res$model$fit.info$Ytrain))
+
+.plot.EPSGO.parms(svm.res$model$fit.info$Xtrain, svm.res$model$fit.info$Ytrain,
+bound=bounds, Ytrain.exclude=10^16, plot.name=NULL )
+
+# the value of lambda - inverse log2
+lambda1 <- svm.res$model$fit.info$model.list$model$lambda1
+lambda1
+
+
+```
+
+======================================== Package: e1071 ==============================================
+
+```{r testing e1071 package}
+# fit linear svm model - using the svm model from package e1071
+
+svm.model.fit <- svm(x = test.dataset,
+                     y = targets$condition,
+                     kernal="linear",
+                     cost=0.01,
+                     scale=TRUE)
+
+# fit cross validated model with customised tunecontrol with tune function in e1701 => leave one out cross valudation of the regularisation / cost parameter
+# could adapt the error.run in the tune control to calculate error based on auc, but likely doesn't make any different. mis-class error fine.
+
+svm.cv.fit <- tune(svm,
+                   train.x = test.dataset,
+                   train.y = targets$condition,
+                   ranges = list(gamma = 2^(-1:1), cost = c(0.001, 0.01, 0.1, 1, 5, 10, 100)),
+                   tunecontrol = tune.control(
+                     sampling = 'cross',
+                     cross = length(targets$condition),
+                     best.model = TRUE),
+                   kernal="radial basis",
+                   scale=TRUE)
+
+# to call the model trained on the full training data set (all folds), using the best parameters detected, use ..$best.model
+svm.cv.fit.tuned <- svm.cv.fit$best.model
+
+summary(svm.cv.fit)
+names(svm.model.fit)
+```
+
+======================================== Package: kernlab / caret ==============================================
+
+```{r testing kernlab and caret packages}
+
+# fit rbf kernal svm model - using package kernlab
+
+svm.model.fit.kl <- ksvm(x = test.dataset,
+                     y = targets$condition,
+                     kernel="rbfdot",
+                     kpar=list(sigma=0.05),
+                     C=0.01,
+                     cross=45)
+
+svm.model.fit.kl
+
+# train a svm model with rbf kernel, with cross validation of C, using caret train function
+
+# create train control object
+
+trainctrl <- trainControl(method = "LOOCV",
+                          savePredictions = 'all',
+                          classProbs= TRUE,
+                          summaryFunction = twoClassSummary)
+
+# create grid of svm regularlisation parameters to tune the svm model on at each iteration
+
+(svm.grid2 <-  expand.grid(C = c(0.01, 0.1, 1, 10)))  
+# (svm.grid <-  expand.grid(sigma = 2^(-1:1), C = c(0.01, 0.1, 1)))  only relevant with rbf kernel
+
+# fit the model
+
+svm.model.fit.caret <- train(x = test.dataset,
+                             y = targets$condition,
+                             method = "svmLinear",
+                             trControl = trainctrl,
+                             #preProcess = c("center", "scale"),
+                             tuneGrid = svm.grid2,
+                             metric = "ROC",
+                             allowParallel = TRUE)
+
+# view a summary of the model output
+svm.model.fit.caret
+
+# get best value of the turning parameter
+svm.model.fit.caret$bestTune
+
+# view the class predictions for all classes
+svm.model.fit.caret$pred
+
+# extract the variable importance
+(imps <- varImp(svm.model.fit.caret))
+
+# get the top x most important features: assume this is on the final fitted model using all the training data
+(imps.top <- dplyr::arrange(imps$importance, by=desc(control))[1:20,])
+rownames(imps.top)
+
+# get the value of AUC for the best value of C
+colnames(svm.model.fit.caret$results)
+dplyr::filter(svm.model.fit.caret$results, C == svm.model.fit.caret$bestTune[[1]])$ROC
+
+max(normalisedCounts)
+
+```
+
+======================================== Package: caret / rfe ==============================================
+
+```{r understanding rfe with caret}
+
+# update the summary function in caretFuncs to the two class summary that includes ROC-AUC
+
+caretFuncs_2class <- caretFuncs
+caretFuncs_2class$summary <- twoClassSummary
+
+# create rfe control object
+
+rfe.control <- rfeControl(functions = caretFuncs_2class,
+                   rerank = FALSE,
+                   method = "LOOCV", #cross validation
+                   verbose = FALSE, #prevents copious amounts of output from being produced.
+                   allowParallel = TRUE)
+
+# create train control object
+
+trainctrl <- trainControl(method = "LOOCV",
+                          savePredictions = 'all',
+                          classProbs= TRUE,
+                          summaryFunction = twoClassSummary)
+
+# create grid of svm regularlisation parameters to tune the svm model on at each iteration
+# parameter names depends on the kernal, and therefore the underlying package supplying the svm model (e1071 / kernlab)
+
+(svm.grid <-  expand.grid(sigma = 2^(-1:1), C = c(0.01, 0.1, 1)))
+(svm.grid2 <-  expand.grid(C = c(0.01, 0.1, 1)))  
+
+## RFE procedure using cross validation, takes some of the arguments of the train function - acts like train.
+# trControl, method, and tuneGrid are arguments to the train function, that are passed to train
+# sizes are the different size of the feature subsets to test: test with a single subset for performance
+# using a linear kernal, 'svmLinear2' uses the e1071 function, with parameter 'cost'
+# using an rbf kernal, uses 'svmRadial' from the kernlab package, with parameters C and sigma
+# set just one subset
+
+svm.rfe.fit <- rfe(x = test.dataset,
+                   y = targets$condition,
+                   sizes = c(20), 
+                   rfeControl = rfe.control,
+                   metric = "ROC",
+                   method = 'svmRadialCost',          
+                   trControl = trainctrl, 
+                   tuneGrid = svm.grid2)
+
+ # details of the rfe - with the selected number of variables from the list of subsets
+
+svm.rfe.fit
+
+## details of all of the relevant slots in the rft fit object ##
+
+## the performance results for each number of variables
+svm.rfe.fit$results
+
+# two ways to get the names of the features selected by the best model
+svm.rfe.fit$optVariables
+predictors(svm.rfe.fit)
+
+# view the ranking of variables in each subset size, over the folds
+svm.rfe.fit$variables
+
+# get the best performance measure (roc) corresponding to the chosen subset
+dplyr::filter(svm.rfe.fit$results, Variables == svm.rfe.fit$optsize)$ROC
+
+# summary of all the slots in the output object from rfe
+summary(svm.rfe.fit)
+
+# $fit get the details of the final model with the selected features, including the performance at different tuning parameters
+# all of the underlying slots for the model are available, in particular $pred for the predictions of the model, and $modelInfo for the details of the model used. $finalModel give the details of the final output model.
+# $fit behaves like the output of train above
+
+svm.rfe.fit$fit
+svm.rfe.fit$fit$pred
+svm.rfe.fit$fit$modelInfo
+svm.rfe.fit$fit$finalModel
+
+# plot the performance of the rfe vs. the number of variables
+trellis.par.set(caretTheme())
+plot(svm.rfe.fit, type = c("g", "o"))
+
+## results gives a table of the performance metrics for each of the number of variables selected (equivalent to the glmnet output for perf. at diff. lanmda)
+svm.rfe.fit$results
+
+## gives the subset of variables with the highest performance (i.e. the number of variables)
+svm.rfe.fit$bestSubset
+
+# control echos the rfe control object, including the cross validation groups
+svm.rfe.fit$control
+
+# dots echos the trControl object
+svm.rfe.fit$dots
+
+# extract variable importance of the top variables
+varImp(svm.rfe.fit)
+
+```
+
+============================================================================================================
+##################################### OLD: SVM Functions for Model Training ################################
+============================================================================================================
+
+Previous implementation using Caret - much slower than the LiblineaR versions above
+Not currently used
+
+=================================== svm feature selection model  ==============================================
+
+```{r svm simple feature importance rank model}
+
+cv.svm.model.fi <- function(x,y){
+
+  #' Performs feature selection using support vector machine, selecting the k-best features based on feature importance
+  #' 
+  #' Applies k-fold cross validation to tune the hyper parameter C
+  #' Features selected based on refitting the model on the full dataset using the selected tuning parameter, and selecting the k-best using varImp()
+  #'
+  #' @param x the input matrix of counts, training set, either vst or rlog transformed
+  #' @param y the class labels
+
+  # create train control object
+  
+  trainctrl <- trainControl(method = "LOOCV",
+                            savePredictions = 'all',
+                            classProbs= TRUE,                       # required to calculate ROC
+                            verboseIter = TRUE,                     # prints details of progress of training
+                            summaryFunction = twoClassSummary)      # includes ROC calculation
+  
+  # create grid of svm regularlisation parameters to tune the svm model on at each iteration
+  
+  (param.grid <-  expand.grid(C = c(0.01, 0.1, 1, 10)))  
+
+  # fit the model. Here using svmLinear that only searches over the C parameter. 
+  
+  svm.model.fit.caret <- train(x = x,
+                               y = y,
+                               method = "svmLinear",                
+                               #preProcess = c("center", "scale"),      # z-score the data
+                               trControl = trainctrl,
+                               tuneGrid = param.grid,
+                               metric = "ROC",
+                               allowParallel = TRUE)
+  
+  # record the ROC for the best tuning parameter
+  (best.auc <- dplyr::filter(svm.model.fit.caret$results, C == svm.model.fit.caret$bestTune[[1]])$ROC)
+  
+  # extract the variable importances - unclear if this is a legitimate way to get the aggregate importance from the svm model
+  imps <- varImp(svm.model.fit.caret)
+  
+  # get the IDs of the top x most important features
+  (fs.ids <- rownames(dplyr::arrange(imps$importance, by=desc(control))[1:20,]))
+  
+  # filter the dataset on the selected features
+  
+  x.filtered <- x[,fs.ids]
+  
+  # retrain a final model on the selected features
+  
+  svm.model.fit.caret.filtered <- train(x = x.filtered,
+                                   y = y,
+                                   method = "svmLinear",
+                                   trControl = trainctrl,
+                                   tuneGrid = param.grid,
+                                   metric = "ROC",
+                                   allowParallel = TRUE)
+  
+  svm.model.final <- svm.model.fit.caret.filtered$finalModel
+  
+  # return the error and the features selected by the model
+  
+  return(list('model' = svm.model.final, 'auc.val' = best.auc, 'fs.ids'=fs.ids))
+}  
+
+```
+
+=================================== svm rfe model  ==============================================
+
+```{r svm rfe - cross validation model - feature selection}
+
+cv.svm.model <- function(x,y){
+
+  #' Performs feature selection using support vector machine, using recursive feature selection, with a k-fold cross validation loop
+  #' 
+  #' This function performs feature selection using recursive feature selection, using an svm model
+  #' Applies k-fold cross validation to select the best sized feature subset (fixed as loocv currently)
+  #' Model is scored based on area under the curve, calculated across all folds
+  #'
+  #' @param x the input matrix of counts, training set, either vst or rlog transformed
+  #' @param y the class labels
+
+  # update the summary function in caretFuncs to the two class summary that includes ROC-AUC
+
+  caretFuncs_2class <- caretFuncs
+  caretFuncs_2class$summary <- twoClassSummary
+  
+  # create rfe control object using the updated carefFuncs object
+  
+  rfe.control <- rfeControl(functions = caretFuncs_2class,
+                     rerank = FALSE,
+                     method = "LOOCV", #cross validation
+                     verbose = FALSE, #prevents copious amounts of output from being produced.
+                     allowParallel = TRUE)
+  
+  # create train control object, specifying the cross valiation method, and the summary evaluation metrics to use
+  
+  trainctrl <- trainControl(method = "LOOCV",
+                            classProbs= TRUE,
+                            savePredictions = 'all',
+                            summaryFunction = twoClassSummary)
+
+  # fit the rfe proceedure, specifying the model, the sizes of feature sets to evaluate, and the values of the tuning parameter for each fit
+  
+  svm.rfe.fit <- rfe(x = test.dataset,
+                     y = targets$condition,
+                     sizes = c(20),                           # limit number of subsets to cut comp time
+                     rfeControl = rfe.control,
+                     metric = "ROC",
+                     method = 'svmRadialCost',
+                     trControl = trainctrl, 
+                     tuneGrid = expand.grid(C = c(0.01, 0.1, 1))      # limit set of tuning parameters to cut comp time
+                    )
+
+  # extract the best auc, and the selected features from the best feature subset
+  
+  fs.ids <- predictors(svm.rfe.fit)
+  best.auc <- dplyr::filter(svm.rfe.fit$results, Variables == svm.rfe.fit$optsize)$ROC
+
+  # return the error and the features selected by the model
+  return(list('model' = svm.rfe.fit, 'auc.val' = best.auc, 'fs.ids'=fs.ids))
+}
+
+```
+
+=================================== bootstrap feature stability model  ==============================================
+
+
+```{r svm - randomised bootstrap function outer loop}
+
+# bootstrap function - run cross validated glm net repeatedly on random bootstraps of the data and measure feature stability
+# no testing of resulting model on a test set - uses inner AUC for evaluation, and allows measurement of feature stability
+
+svmBoostrapStabilityPerf <- function(x, y, num.boots){
+
+  (num.features <- dim(x)[1])
+  (num.samples <- dim(x)[2])
+  
+  # create combined dataset for stratified sampling
+  xy.mat <- as.data.frame(t(x)) %>% tibble::rownames_to_column(var = "analysisID")
+  if(!all(xy.mat$analysisID == y$analysisID)){stop()}
+  xy.mat$class <- y$condition
+  
+  # containers for the output scores and record of the selected features
+  auc.cv.inner      <- vector("double", num.boots)
+  fs.lst            <- vector("list", num.boots)
+  
+  for (i in seq_along(1:num.boots)){
+  
+    print(sprintf('Bootstrap %d out of %d', i, num.boots))
+  
+    # create bootstrapped dataset
+    samples.output <- xy.mat %>% dplyr::group_by(class) %>%
+                                dplyr::slice_sample(prop=0.7) %>%
+                                ungroup() %>%
+                                tibble::column_to_rownames(var = "analysisID")
+  
+    x.boots <-   as.matrix(subset(samples.output, select=-c(class)))
+    y.boots <-   droplevels(samples.output$class)
+
+    # fit cv model and return auc and selected features matrix
+    fs.model       <-  cv.svm.model.fi(x= x.boots,
+                                    y = y.boots)
+    
+    # add the IDs of the selected features to the list
+    (fs.lst[i] <- list(fs.model$fs.ids))
+  
+    # record the auc from the cross validation of the feature selection stage
+    (auc.cv.inner[i] <- fs.model$auc.val)
+  }
+
+  # create binary matrix from selected features list
+
+  fs.matrix <- createBinaryMatrix(fs.lst, rownames(x))
+  
+  # aggregate performance metrics over all random bootstraps of the data
+  
+  (fs.stability <- getStability(fs.matrix))
+  (mean.feaures.sel <- mean(rowSums(fs.matrix)))
+  (auc <- mean(auc.cv.inner))
+  
+  return(list('auc'  = auc,
+              'stability'= fs.stability$stability,
+              'feature.ids' = fs.lst,
+              'mean.features.sel' = mean.feaures.sel,
+              'sel.matrix' = fs.matrix
+              ))
+}
+
+```
+
+
+```{r creating binary matrix of the selected features from the model output}
+
+createBinaryMatrix <- function(sel_f_list, full_f_list){
+  
+  #' creates a binary matrix from the list of selected features and the full feature list
+  #'
+  #' @param sel_f_list a list of lists of IDs of the selected features
+  #' @param full_f_list the full list of feature names they were originally selected from, in original order - i.e. training set column names
+
+  # get indices of selected features
+  
+  (f_idx <- map(sel_f_list, function(x) {match(x, full_f_list)}))
+  
+  # get the number of genes in the list
+  
+  (n_genes <-  length(full_f_list))
+  
+  # setNames names the list elements with their index, to capture the original indices of the list elements
+  # Filter(Negate(is.null),...) then removes any list elements that have NULL values, but allows preservation of original indices as the names
+  # then melt this to a dataframe, where the names, i.e. original list indices become the second column of d2
+  
+  (f_list_melt <- melt(Filter(Negate(is.null), setNames(f_idx, seq_along(f_idx)))))
+  
+  # create a matrix of zeros to become the binary matrix - row for each list of selected features, cols for the full feature set
+  
+  (bin_mat <- matrix(0, nrow=length(f_idx), ncol=max(n_genes)))
+
+  # cbind(as.numeric(d2...)) recreates a matrix, swapping the columns, so the row index is the first column, and column index is secont
+  # then m1 matrix can be sliced on this, i.e. on the coordinates where the value is replaced by 1
+
+  bin_mat[cbind(as.numeric(f_list_melt[,2]), f_list_melt[,1])] <- 1
+
+  return(bin_mat)
+}
+
+```
+
+
+
+============================================================================================================
+##################################### Protect Sepsis Data Set - SVM ########################################
+============================================================================================================
+
+============================================ Function Testing ==============================================
+
+```{r protect dataset testing logistic regression functions}
+
+# test inner loop function for svm with the simplified feature importances model
+
+protect.svm.results <- cv.svm.model.fi(x = test.dataset, y = targets$condition)
+
+# load matrix of all ensembl gene IDs and names
+
+ensembl_all_genes <- read.table("../resources/ensembl_all_genes.txt", fill = TRUE, sep=",", header=T)
+(gene.names.filtered <- dplyr::filter(ensembl_all_genes, Gene.stable.ID %in% protect.svm.results$fs.ids))
+
+# test boostrap outer loop function
+protect.svm.boostrap.res <- svmBoostrapStabilityPerf(x = datasets.fold.change.above.two[[1]],
+                                                    y = targets,
+                                                    num.boots = 5)
+
+# view outputs
+protect.svm.boostrap.res$auc
+protect.svm.boostrap.res$stability
+protect.svm.boostrap.res$mean.features.sel
+protect.svm.boostrap.res$feature.ids
+
+# check that the average number of features selected is the number specified
+mean(rowSums(protect.svm.boostrap.res$sel.matrix))
+
+```
+
+=================================== AUC at alternative noise thresholds ============================
+
+```{r}
+# testing removing the genes with all zeros
+
+# create vst transformed datasets at alternative noise thresholds
+
+datasets.noise.protect <- createNoiseThresholdDatasets(raw.counts  = countsData,
+                                                   norm.counts = normalisedCounts,
+                                                   sample.info = targets,
+                                                   t.range     = seq(0, 50, 10))
+
+# transpose back - inconsistency in the orientation of the datasets as intput to the ML models
+datasets.noise.protect <- map(datasets.noise.protect, function(x){t(x)})
+
+# mat the alternative datasets to the bootstrap stability performance function
+
+model.results.noise.svm <- map(datasets.noise.protect, svmBoostrapStabilityPerf,
+                           y=targets,
+                           num.boots = 20)
+
+# save output given run times
+save(model.results.noise.svm,    file=paste(data.path, "model.results.noise.svm.RData", sep=""))
+#load(file=paste(data.path, "model.results.noise.RData", sep=""))
+
+
+```
+
+======================== AUC at alternative cooks distance quantiles thresholds ====================
+
+```{r}
+# create vst transformed datasets at alternative outlier thresholds
+
+datasets.outliers.protect <- createOutlierThresholdDatasets(raw.counts  = countsData,
+                                                  norm.counts = normalisedCounts,
+                                                  sample.info = targets,
+                                                  noise.fil   = 25,
+                                                  q.range     = seq(0.99, 0.9, -0.01))
+
+# transpose back - inconsistency in the orientation of the datasets as intput to the ML models
+datasets.outliers.protect <- map(datasets.outliers.protect, function(x){t(x)})
+
+# map to function to generate the auc, and stability metrics
+model.results.outliers.svm <- map(datasets.outliers.protect, svmBoostrapStabilityPerf,
+                                  y=targets,
+                                  num.boots = 20)
+
+# save output given run times
+save(model.results.outliers.svm,    file=paste(data.path, "model.results.outliers.svm.RData", sep=""))
+#load(file=paste(data.path, "model.results.outliers.RData", sep=""))
+```
